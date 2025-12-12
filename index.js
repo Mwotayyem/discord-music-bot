@@ -134,13 +134,13 @@ client.on('messageCreate', async (message) => {
         const count = client.helloCounts.get(userId) || 0;
 
         if (count === 0) {
-            message.reply('اهلا وسهلا بك في قناة التيم! 🎉');
+            message.reply('شدك !!! وليش جاي!! 🤨');
             client.helloCounts.set(userId, 1);
         } else if (count === 1) {
-            message.reply('اهلين هسه جاي');
+            message.reply('" كس اخت مرحبا " شو الي بدك اياه 🤬');
             client.helloCounts.set(userId, 2);
         } else {
-            message.reply('اسب ام مرحبا وبعدين 😤');
+            message.reply('يلعن شراميطها امك 🤬�');
             // يمكننا تصفير العداد بعد فترة إذا أردت
             // client.helloCounts.set(userId, 0); 
         }
@@ -154,6 +154,25 @@ client.on('messageCreate', async (message) => {
         if (content.includes(trigger.toLowerCase())) {
             message.reply(response);
             return; // الرد على أول كلمة مطابقة فقط
+        }
+    }
+});
+
+// ═══════════════════════════════════════
+// الترحيب عند دخول الروم الصوتي
+// ═══════════════════════════════════════
+client.on('voiceStateUpdate', (oldState, newState) => {
+    // التحقق من أن المستخدم انضم لقناة صوتية جديدة
+    if (!oldState.channelId && newState.channelId) {
+        // البحث عن قناة نصية لإرسال الترحيب
+        // نستخدم القناة التي تسمى 'general' أو 'chat' أو أول قناة نصية يجدها
+        const textChannel = newState.guild.channels.cache.find(c =>
+            c.type === 0 && // 0 يعني قناة نصية
+            (c.name.includes('general') || c.name.includes('chat') || c.name.includes('عام'))
+        ) || newState.guild.systemChannel;
+
+        if (textChannel) {
+            textChannel.send(`أهلا بالهايت الجديد ${newState.member} 🔪🩸`);
         }
     }
 });
