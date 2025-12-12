@@ -172,7 +172,7 @@ client.on('voiceStateUpdate', (oldState, newState) => {
         ) || newState.guild.systemChannel;
 
         if (textChannel) {
-            textChannel.send(`أهلا بالهايت الجديد ${newState.member} 🔪🩸`);
+            textChannel.send(`اسمعو يا منايك ${newState.member} وصل 🔪🩸`);
         }
     }
 });
