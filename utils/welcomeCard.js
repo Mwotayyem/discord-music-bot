@@ -5,7 +5,7 @@ const PImage = require('pureimage');
 const CARD_WIDTH = 900;
 const CARD_HEIGHT = 300;
 const FONT_NAME = 'WelcomeFont';
-const DEFAULT_FONT_PATH = process.env.WELCOME_FONT_PATH || 'C:\\Windows\\Fonts\\arial.ttf';
+const DEFAULT_FONT_PATH = process.env.WELCOME_FONT_PATH || getDefaultFontPath();
 let fontReady;
 
 function loadFont() {
@@ -270,3 +270,11 @@ function normalizeName(name) {
 module.exports = {
     createWelcomeCard
 };
+
+function getDefaultFontPath() {
+    if (process.platform === 'win32') {
+        return 'C:\\Windows\\Fonts\\arial.ttf';
+    }
+
+    return '/usr/share/fonts/truetype/dejavu/DejaVuSans.ttf';
+}

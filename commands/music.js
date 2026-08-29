@@ -14,8 +14,9 @@ const { promisify } = require('util');
 const path = require('path');
 const fs = require('fs');
 
-// تحديد مسار yt-dlp
-const ytDlpPath = path.join(process.cwd(), 'yt-dlp.exe');
+// تحديد مسار yt-dlp حسب نظام التشغيل
+const ytDlpFileName = process.platform === 'win32' ? 'yt-dlp.exe' : 'yt-dlp';
+const ytDlpPath = path.join(process.cwd(), ytDlpFileName);
 const execFileAsync = promisify(execFile);
 const ytdlpCookiesFromBrowser = process.env.YTDLP_COOKIES_FROM_BROWSER?.trim();
 const ytdlpCookiesFile = process.env.YTDLP_COOKIES_FILE?.trim();
