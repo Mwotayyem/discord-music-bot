@@ -4,9 +4,10 @@
  */
 
 require('dotenv').config();
-const { Client, GatewayIntentBits, EmbedBuilder, ActivityType } = require('discord.js');
+const { Client, GatewayIntentBits, EmbedBuilder, ActivityType, ChannelType, PermissionFlagsBits, Events, AttachmentBuilder } = require('discord.js');
 const { autoResponses } = require('./config/responses');
 const musicCommands = require('./commands/music');
+const { createWelcomeCard } = require('./utils/welcomeCard');
 
 // إنشاء العميل مع الصلاحيات المطلوبة
 const client = new Client({
@@ -21,9 +22,16 @@ const client = new Client({
 
 // البادئة للأوامر
 const PREFIX = process.env.PREFIX || '!';
+const WELCOME_CHANNEL_ID = process.env.WELCOME_CHANNEL_ID;
+const WELCOME_BANNER_URL = process.env.WELCOME_BANNER_URL;
+const AUTO_ROLE_ID = process.env.AUTO_ROLE_ID;
+const WELCOME_COLOR = parseHexColor(process.env.WELCOME_COLOR, 0x5865F2);
+const voiceWelcomeCooldowns = new Map();
+const helloCounts = new Map();
+const VOICE_WELCOME_COOLDOWN_MS = 15000;
 
 // عند تشغيل البوت
-client.once('ready', () => {
+client.once(Events.ClientReady, () => {
     console.log('═══════════════════════════════════════');
     console.log(`🤖 البوت جاهز! تم تسجيل الدخول كـ ${client.user.tag}`);
     console.log(`📊 متصل بـ ${client.guilds.cache.size} سيرفر`);
@@ -31,7 +39,7 @@ client.once('ready', () => {
     console.log('═══════════════════════════════════════');
 
     // تعيين حالة البوت
-    client.user.setActivity('🎵 اكتب !help', { type: ActivityType.Listening });
+    client.user.setActivity(`🎵 اكتب ${PREFIX}help`, { type: ActivityType.Listening });
 });
 
 // عند استقبال رسالة
@@ -46,8 +54,7 @@ client.on('messageCreate', async (message) => {
     // ═══════════════════════════════════════
 
     if (message.content.startsWith(PREFIX)) {
-        const args = message.content.slice(PREFIX.length).trim().split(/ +/);
-        const command = args.shift().toLowerCase();
+        const { command, args } = parseCommandInput(message.content);
 
         switch (command) {
             // أوامر المساعدة
@@ -126,56 +133,322 @@ client.on('messageCreate', async (message) => {
     // الردود التلقائية (بعد الأوامر)
     // ═══════════════════════════════════════
 
-    // ذاكرة مؤقتة لتعسيب البوت 😂
-    if (!client.helloCounts) client.helloCounts = new Map();
-
     if (content.includes('مرحبا') || content.includes('مرحبه')) {
         const userId = message.author.id;
-        const count = client.helloCounts.get(userId) || 0;
+        const count = helloCounts.get(userId) || 0;
 
         if (count === 0) {
             message.reply('شدك !!! وليش جاي!! 🤨');
-            client.helloCounts.set(userId, 1);
+            helloCounts.set(userId, 1);
         } else if (count === 1) {
             message.reply('" كس اخت مرحبا " شو الي بدك اياه 🤬');
-            client.helloCounts.set(userId, 2);
+            helloCounts.set(userId, 2);
         } else {
-            message.reply('يلعن شراميطها امك 🤬�');
-            // يمكننا تصفير العداد بعد فترة إذا أردت
-            // client.helloCounts.set(userId, 0); 
+            message.reply('يلعن شراميطها امك 🤬');
         }
+
         return;
     }
 
     for (const [trigger, response] of Object.entries(autoResponses)) {
-        // نتخطى مرحبا لأننا تعاملنا معها فوق
         if (trigger.includes('مرحبا') || trigger.includes('مرحبه')) continue;
 
         if (content.includes(trigger.toLowerCase())) {
-            message.reply(response);
+            message.reply(typeof response === 'function' ? response(message) : response);
             return; // الرد على أول كلمة مطابقة فقط
         }
     }
 });
 
 // ═══════════════════════════════════════
+// الترحيب عند دخول عضو جديد للسيرفر
+// ═══════════════════════════════════════
+client.on('guildMemberAdd', async (member) => {
+    const textChannel = pickWelcomeChannel(member.guild);
+    if (!textChannel) return;
+
+    await giveAutoRole(member);
+
+    const payload = await buildServerWelcomePayload(member);
+
+    textChannel.send(payload).catch((error) => {
+        console.error('❌ Welcome message error:', error.message);
+    });
+});
+
+// ═══════════════════════════════════════
 // الترحيب عند دخول الروم الصوتي
 // ═══════════════════════════════════════
-client.on('voiceStateUpdate', (oldState, newState) => {
-    // التحقق من أن المستخدم انضم لقناة صوتية جديدة
-    if (!oldState.channelId && newState.channelId) {
-        // البحث عن قناة نصية لإرسال الترحيب
-        // نستخدم القناة التي تسمى 'general' أو 'chat' أو أول قناة نصية يجدها
-        const textChannel = newState.guild.channels.cache.find(c =>
-            c.type === 0 && // 0 يعني قناة نصية
-            (c.name.includes('general') || c.name.includes('chat') || c.name.includes('عام'))
-        ) || newState.guild.systemChannel;
+client.on('voiceStateUpdate', async (oldState, newState) => {
+    if (oldState.channelId || !newState.channelId || !newState.member) return;
+    if (newState.member.user.bot) return;
 
-        if (textChannel) {
-            textChannel.send(`اسمعو يا منايك ${newState.member} وصل 🔪🩸`);
-        }
-    }
+    const cooldownKey = `${newState.guild.id}:${newState.member.id}`;
+    const lastWelcome = voiceWelcomeCooldowns.get(cooldownKey) || 0;
+    if (Date.now() - lastWelcome < VOICE_WELCOME_COOLDOWN_MS) return;
+    voiceWelcomeCooldowns.set(cooldownKey, Date.now());
+
+    const textChannel = pickWelcomeChannel(newState.guild);
+    if (!textChannel) return;
+
+    const payload = await buildVoiceWelcomePayload(newState.member, newState.channel);
+
+    textChannel.send(payload).catch((error) => {
+        console.error('❌ Voice welcome error:', error.message);
+    });
 });
+
+function pickWelcomeChannel(guild) {
+    const configuredChannel = WELCOME_CHANNEL_ID ? guild.channels.cache.get(WELCOME_CHANNEL_ID) : null;
+    if (isUsableTextChannel(configuredChannel)) return configuredChannel;
+
+    const preferredNames = ['welcome', 'ترحيب', 'الترحيب', 'general', 'chat', 'عام', 'شات'];
+    const namedChannel = guild.channels.cache.find((channel) => {
+        if (!isUsableTextChannel(channel)) return false;
+        const channelName = channel.name.toLowerCase();
+        return preferredNames.some((name) => channelName.includes(name));
+    });
+
+    if (namedChannel) return namedChannel;
+    if (isUsableTextChannel(guild.systemChannel)) return guild.systemChannel;
+
+    return guild.channels.cache.find(isUsableTextChannel);
+}
+
+function isUsableTextChannel(channel) {
+    if (!channel || channel.type !== ChannelType.GuildText) return false;
+
+    const me = channel.guild.members.me;
+    if (!me) return true;
+
+    const permissions = channel.permissionsFor(me);
+    return permissions?.has([
+        PermissionFlagsBits.ViewChannel,
+        PermissionFlagsBits.SendMessages,
+        PermissionFlagsBits.EmbedLinks
+    ]);
+}
+
+async function giveAutoRole(member) {
+    if (!AUTO_ROLE_ID || member.user.bot) return;
+
+    try {
+        await member.roles.add(AUTO_ROLE_ID, 'Auto role for new members');
+    } catch (error) {
+        console.error('❌ Auto role error:', error.message);
+    }
+}
+
+async function buildServerWelcomePayload(member) {
+    try {
+        const cardBuffer = await createWelcomeCard(member);
+        const attachment = new AttachmentBuilder(cardBuffer, {
+            name: 'welcome-card.png'
+        });
+        const memberNumber = formatOrdinal(member.guild.memberCount || 1);
+
+        return {
+            content: `Welcome ${member} to **${member.guild.name}**! You are the **${memberNumber}** member!`,
+            files: [attachment]
+        };
+    } catch (error) {
+        console.error('❌ Welcome card error:', error.message);
+        const memberNumber = formatOrdinal(member.guild.memberCount || 1);
+
+        return {
+            content: `Welcome ${member} to **${member.guild.name}**! You are the **${memberNumber}** member!`,
+            embeds: [buildServerWelcomeEmbed(member)]
+        };
+    }
+}
+
+async function buildVoiceWelcomePayload(member, voiceChannel) {
+    try {
+        const cardBuffer = await createWelcomeCard(member, {
+            eyebrow: 'VOICE JOIN',
+            title: cleanDisplayName(member.displayName),
+            subtitle: 'joined the voice channel',
+            detail: 'Ready for music'
+        });
+        const attachment = new AttachmentBuilder(cardBuffer, {
+            name: 'voice-welcome-card.png'
+        });
+
+        return {
+            content: `🎧 ${member} دخل روم **${voiceChannel.name}**`,
+            files: [attachment]
+        };
+    } catch (error) {
+        console.error('❌ Voice welcome card error:', error.message);
+
+        return {
+            embeds: [buildVoiceWelcomeEmbed(member, voiceChannel)]
+        };
+    }
+}
+
+function buildServerWelcomeEmbed(member) {
+    const displayName = cleanDisplayName(member.displayName);
+    const createdAt = Math.floor(member.user.createdTimestamp / 1000);
+    const memberNumber = member.guild.memberCount ? `#${member.guild.memberCount}` : 'عضو جديد';
+
+    const embed = new EmbedBuilder()
+        .setColor(WELCOME_COLOR)
+        .setAuthor({
+            name: `Welcome to ${member.guild.name}`,
+            iconURL: member.guild.iconURL({ dynamic: true }) || undefined
+        })
+        .setTitle(`╭── أهلاً ${displayName} ──╮`)
+        .setDescription([
+            `يا هلا ${member}، نورت السيرفر.`,
+            '',
+            `**${decorateName(displayName)}**`,
+            '',
+            'نتمنى لك وقت ممتع، شاركنا جوك وخذ راحتك بين أهلك.'
+        ].join('\n'))
+        .setThumbnail(member.user.displayAvatarURL({ dynamic: true, size: 256 }))
+        .addFields(
+            { name: 'العضو', value: member.user.tag, inline: true },
+            { name: 'ترتيب الدخول', value: memberNumber, inline: true },
+            { name: 'الحساب', value: `<t:${createdAt}:R>`, inline: true }
+        )
+        .setFooter({ text: 'استمتع بالموسيقى والجو الجميل' })
+        .setTimestamp();
+
+    if (WELCOME_BANNER_URL) {
+        embed.setImage(WELCOME_BANNER_URL);
+    }
+
+    return embed;
+}
+
+function buildVoiceWelcomeEmbed(member, voiceChannel) {
+    const displayName = cleanDisplayName(member.displayName);
+
+    return new EmbedBuilder()
+        .setColor(0x2ECC71)
+        .setTitle('🎧 دخول للروم الصوتي')
+        .setDescription([
+            `**${decorateName(displayName)}**`,
+            '',
+            `${member} دخل روم **${voiceChannel.name}**.`,
+            'جاهزين للموسيقى؟'
+        ].join('\n'))
+        .setThumbnail(member.user.displayAvatarURL({ dynamic: true, size: 128 }))
+        .setFooter({ text: 'اكتب أمر تشغيل أغنية داخل الشات' })
+        .setTimestamp();
+}
+
+function decorateName(name) {
+    return `╔══ ${name} ══╗`;
+}
+
+function formatOrdinal(number) {
+    const value = Number(number);
+    const lastTwoDigits = value % 100;
+
+    if (lastTwoDigits >= 11 && lastTwoDigits <= 13) return `${value}th`;
+
+    switch (value % 10) {
+        case 1:
+            return `${value}st`;
+        case 2:
+            return `${value}nd`;
+        case 3:
+            return `${value}rd`;
+        default:
+            return `${value}th`;
+    }
+}
+
+function cleanDisplayName(name) {
+    return name
+        .replace(/[`*_~|\\]/g, '')
+        .slice(0, 40);
+}
+
+function parseHexColor(value, fallback) {
+    if (!value) return fallback;
+
+    const normalized = value.replace('#', '').trim();
+    if (!/^[0-9a-f]{6}$/i.test(normalized)) return fallback;
+
+    return parseInt(normalized, 16);
+}
+
+function parseCommandInput(rawContent) {
+    const input = rawContent.slice(PREFIX.length).trim();
+    const aliases = [
+        'السلامة',
+        'معلومات',
+        'مساعدة',
+        'تشغيل',
+        'التالي',
+        'القائمة',
+        'ايقاف',
+        'استمر',
+        'تخطي',
+        'توقف',
+        'اوامر',
+        'انضم',
+        'تعال',
+        'اخرج',
+        'غادر',
+        'روح',
+        'بنق',
+        'شغل',
+        'play',
+        'help',
+        'skip',
+        'stop',
+        'pause',
+        'resume',
+        'queue',
+        'join',
+        'leave',
+        'info',
+        'ping',
+        'p',
+        's',
+        'q'
+    ].sort((a, b) => b.length - a.length);
+
+    const lowerInput = input.toLowerCase();
+
+    for (const alias of aliases) {
+        if (!lowerInput.startsWith(alias)) continue;
+
+        const rest = input.slice(alias.length).trim();
+        const lowerRest = rest.toLowerCase();
+        const validBoundary = !rest
+            || /^\s/.test(input.charAt(alias.length))
+            || /^["'`“”«»]/.test(rest)
+            || lowerRest.startsWith('http://')
+            || lowerRest.startsWith('https://')
+            || lowerRest.startsWith('www.');
+
+        if (!validBoundary) continue;
+
+        return {
+            command: alias,
+            args: rest ? [stripWrappingQuotes(rest)] : []
+        };
+    }
+
+    const args = input.split(/ +/);
+    return {
+        command: (args.shift() || '').toLowerCase(),
+        args
+    };
+}
+
+function stripWrappingQuotes(value) {
+    return value
+        .trim()
+        .replace(/^[`"'“”«»]+/, '')
+        .replace(/[`"'“”«»]+$/, '')
+        .trim();
+}
 
 /**
  * إرسال رسالة المساعدة
@@ -189,7 +462,7 @@ function sendHelpEmbed(message) {
             {
                 name: '🎶 أوامر الموسيقى',
                 value:
-                    `\`${PREFIX}play [اسم/رابط]\` أو \`${PREFIX}شغل\` - تشغيل أغنية
+                    `\`${PREFIX}play [رابط يوتيوب]\` أو \`${PREFIX}شغل\` - تشغيل أغنية من رابط
 \`${PREFIX}skip\` أو \`${PREFIX}تخطي\` - تخطي الأغنية الحالية
 \`${PREFIX}stop\` أو \`${PREFIX}ايقاف\` - إيقاف الموسيقى والمغادرة
 \`${PREFIX}pause\` أو \`${PREFIX}توقف\` - إيقاف مؤقت

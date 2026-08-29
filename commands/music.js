@@ -8,13 +8,19 @@ const {
     NoSubscriberBehavior,
     StreamType
 } = require('@discordjs/voice');
-const YTDlpWrap = require('yt-dlp-wrap').default;
+const ffmpegPath = require('ffmpeg-static') || 'ffmpeg';
+const { execFile, spawn } = require('child_process');
+const { promisify } = require('util');
 const path = require('path');
 const fs = require('fs');
 
 // تحديد مسار yt-dlp
 const ytDlpPath = path.join(process.cwd(), 'yt-dlp.exe');
-const ytDlp = new YTDlpWrap(ytDlpPath);
+const execFileAsync = promisify(execFile);
+const ytdlpCookiesFromBrowser = process.env.YTDLP_COOKIES_FROM_BROWSER?.trim();
+const ytdlpCookiesFile = process.env.YTDLP_COOKIES_FILE?.trim();
+const ytdlpJsRuntime = process.env.YTDLP_JS_RUNTIME?.trim() || 'node';
+const ytdlpExtractorArgs = process.env.YTDLP_EXTRACTOR_ARGS?.trim() || 'youtube:player_client=android';
 
 // تخزين مشغلات الصوت لكل سيرفر
 const queues = new Map();
@@ -34,6 +40,90 @@ function getQueue(guildId) {
         });
     }
     return queues.get(guildId);
+}
+
+async function runYtDlp(args) {
+    const { stdout } = await execFileAsync(ytDlpPath, [
+        ...getYtDlpBaseArgs(),
+        ...args
+    ], {
+        maxBuffer: 1024 * 1024 * 20
+    });
+
+    return stdout;
+}
+
+function getYtDlpBaseArgs() {
+    const args = [
+        '--no-config',
+        '--js-runtimes', ytdlpJsRuntime,
+        '--extractor-args', ytdlpExtractorArgs,
+        '--extractor-retries', '5',
+        '--retry-sleep', 'extractor:linear=1:4:1'
+    ];
+
+    if (ytdlpCookiesFromBrowser) {
+        args.push('--cookies-from-browser', ytdlpCookiesFromBrowser);
+    } else if (ytdlpCookiesFile) {
+        args.push('--cookies', ytdlpCookiesFile);
+    }
+
+    return args;
+}
+
+function parseYtDlpJson(output) {
+    const trimmedOutput = output.trim();
+
+    try {
+        return JSON.parse(trimmedOutput);
+    } catch (error) {
+        const firstJsonLine = trimmedOutput
+            .split(/\r?\n/)
+            .find((line) => line.trim().startsWith('{'));
+
+        if (!firstJsonLine) throw error;
+        return JSON.parse(firstJsonLine);
+    }
+}
+
+function getFriendlyYtDlpError(error) {
+    const details = `${error.stderr || ''}\n${error.stdout || ''}\n${error.message || ''}`;
+
+    if (/sign in to confirm|not a bot|too many requests|HTTP Error 429/i.test(details)) {
+        return [
+            'يوتيوب طلب تحقق وما سمح للبوت يسحب الصوت.',
+            'الحل الأقوى هو تفعيل cookies من متصفحك في `.env`، لكن هذا يسمح لـ yt-dlp بقراءة جلسة YouTube من المتصفح.',
+            'بعد موافقتك، يمكن ضبط `YTDLP_COOKIES_FROM_BROWSER=chrome` أو `edge` ثم تعيد تشغيل البوت.'
+        ].join('\n');
+    }
+
+    if (/cookies/i.test(details)) {
+        return 'حدثت مشكلة في قراءة cookies المتصفح. أغلق المتصفح بالكامل ثم أعد تشغيل البوت، أو جرّب تغيير المتصفح في `.env`.';
+    }
+
+    return error.message;
+}
+
+function extractUrl(value) {
+    const match = String(value).match(/(?:https?:\/\/|www\.)[^\s<>"')\]]+/i);
+    if (!match) return null;
+
+    const url = match[0].replace(/[.,;!?]+$/, '');
+    return url.startsWith('www.') ? `https://${url}` : url;
+}
+
+function isYouTubeUrl(value) {
+    try {
+        const url = new URL(value);
+        const host = url.hostname.toLowerCase().replace(/^www\./, '');
+
+        return host === 'youtube.com'
+            || host === 'youtu.be'
+            || host === 'm.youtube.com'
+            || host === 'music.youtube.com';
+    } catch (error) {
+        return false;
+    }
 }
 
 /**
@@ -65,7 +155,7 @@ async function playSong(guildId, song) {
 
         // 1. استخراج رابط البث المباشر باستخدام yt-dlp
         // هذا الرابط يكون مباشراً لسيرفرات جوجل
-        const directUrl = await ytDlp.execPromise([
+        const directUrl = await runYtDlp([
             song.url,
             '-f', 'bestaudio/best',
             '-g' // Get URL only
@@ -75,29 +165,37 @@ async function playSong(guildId, song) {
 
         // 2. تشغيل الرابط المباشر باستخدام FFmpeg مع خيارات إعادة الاتصال
         // هذا يمنع توقف الأغنية في المنتصف
-        const ffmpegProcess = require('child_process').spawn('ffmpeg', [
+        const ffmpegProcess = spawn(ffmpegPath, [
             '-reconnect', '1',
             '-reconnect_streamed', '1',
             '-reconnect_delay_max', '5',
             '-i', directUrl.trim(),
+            '-vn',
             '-acodec', 'libopus',
-            '-f', 'opus',
+            '-application', 'audio',
+            '-frame_duration', '20',
+            '-f', 'ogg',
             '-ac', '2',
             '-ar', '48000',
             'pipe:1'
         ]);
 
         const resource = createAudioResource(ffmpegProcess.stdout, {
-            inputType: StreamType.Arbitrary,
-            inlineVolume: true
+            inputType: StreamType.OggOpus
         });
-
-        resource.volume?.setVolume(0.5);
 
         // معالجة أخطاء FFmpeg
         ffmpegProcess.stderr.on('data', (data) => {
-            // يمكن تجاهل الرسائل العادية، فقط نعرض الأخطاء إذا توقف
-            // console.log(`FFmpeg: ${data}`);
+            const message = data.toString();
+            if (/error|failed|Invalid|Unknown/i.test(message)) {
+                console.error(`FFmpeg stderr: ${message}`);
+            }
+        });
+
+        ffmpegProcess.on('close', (code, signal) => {
+            if (code !== 0) {
+                console.error(`FFmpeg exited with code ${code} signal ${signal}`);
+            }
         });
 
         ffmpegProcess.on('error', (err) => {
@@ -124,10 +222,10 @@ async function playSong(guildId, song) {
         }
 
     } catch (error) {
-        console.error('❌ Error playing song:', error.message);
+        console.error('❌ Error playing song:', error.stderr || error.message);
 
         if (queue.textChannel) {
-            queue.textChannel.send(`❌ حدث خطأ أثناء تشغيل الأغنية: ${error.message}`);
+            queue.textChannel.send(`❌ حدث خطأ أثناء تشغيل الأغنية:\n${getFriendlyYtDlpError(error)}`);
         }
 
         queue.songs.shift();
@@ -147,32 +245,41 @@ async function playCommand(message, args) {
         return message.reply('❌ يجب أن تكون في قناة صوتية أولاً!');
     }
 
-    if (!args.length) {
-        return message.reply('❌ الرجاء إدخال اسم الأغنية أو رابط يوتيوب!');
+    if (!fs.existsSync(ytDlpPath)) {
+        return message.reply('❌ ملف yt-dlp غير موجود. شغّل الأمر `npm run setup` مرة واحدة ثم جرّب تشغيل الأغاني من جديد.');
     }
 
-    const searchQuery = args.join(' ');
+    if (!args.length) {
+        return message.reply('❌ أرسل رابط يوتيوب بعد الأمر.\nمثال: `!شغل https://www.youtube.com/watch?v=VIDEO_ID`');
+    }
+
+    const requestedInput = args.join(' ').trim();
+    const youtubeUrl = extractUrl(requestedInput);
+
+    if (!youtubeUrl || !isYouTubeUrl(youtubeUrl)) {
+        return message.reply('❌ هذا الأمر يقبل روابط YouTube فقط.\nمثال: `!شغل https://youtu.be/VIDEO_ID`');
+    }
+
     const guildId = message.guild.id;
 
     try {
-        message.channel.send('🔍 جاري البحث...');
+        message.channel.send('🔍 جاري تجهيز رابط يوتيوب...');
 
         let songInfo;
         let metadata;
 
-        // البحث باستخدام yt-dlp
-        const query = searchQuery.startsWith('http') ? searchQuery : `ytsearch1:${searchQuery}`;
+        const query = youtubeUrl;
 
         console.log(`🔍 تشغيل yt-dlp للبحث عن: ${query}`);
 
-        metadata = await ytDlp.execPromise([
+        metadata = await runYtDlp([
             query,
             '--dump-json',
             '--no-playlist',
             '--flat-playlist'
         ]);
 
-        const info = JSON.parse(metadata);
+        const info = parseYtDlpJson(metadata);
         const videoData = info.entries ? info.entries[0] : info;
 
         if (!videoData) {
@@ -270,8 +377,8 @@ async function playCommand(message, args) {
         }
 
     } catch (error) {
-        console.error('❌ Play command error:', error.message);
-        message.reply(`❌ حدث خطأ: ${error.message}`);
+        console.error('❌ Play command error:', error.stderr || error.message);
+        message.reply(`❌ حدث خطأ:\n${getFriendlyYtDlpError(error)}`);
     }
 }
 
