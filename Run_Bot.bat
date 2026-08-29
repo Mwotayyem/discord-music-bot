@@ -22,5 +22,11 @@ if not exist yt-dlp.exe (
     call npm run setup
 )
 
+:restart
 node index.js
+echo.
+echo Bot stopped or crashed. Restarting in 10 seconds...
+timeout /t 10 /nobreak >nul
+goto restart
+
 pause
